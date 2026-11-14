@@ -1,0 +1,10 @@
+.DS_Store
+Thumbs.db
+*.wav
+*.flac
+*.aiff
+*.m4a
+*.aac
+*.ogg
+source/
+tmp/
