@@ -8,3 +8,7 @@ Thumbs.db
 *.ogg
 source/
 tmp/
+.venv/
+
+.audio-cache/
+odilxanivich-1-listening-audio-script.md
