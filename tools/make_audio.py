@@ -17,7 +17,7 @@ Options
 
 Each synthesized sentence is cached in .audio-cache/, so if your connection drops just run it again.
 """
-import argparse, asyncio, hashlib, re, shutil, subprocess, sys, tempfile
+import argparse, asyncio, hashlib, json, re, shutil, subprocess, sys, tempfile, wave
 from pathlib import Path
 
 # Voice per speaker. List all voices with:  edge-tts --list-voices
@@ -30,9 +30,17 @@ VOICES = {
     "Daniel": "en-AU-WilliamNeural",
     "Seo-yeon": "en-AU-NatashaNeural",
     "Professor Kang": "en-IE-ConnorNeural",
+    # TOEIC accents (US / UK / Australian)
+    "W-US": "en-US-JennyNeural",
+    "M-US": "en-US-GuyNeural",
+    "W-UK": "en-GB-MaisieNeural",
+    "M-UK": "en-GB-ThomasNeural",
+    "W-AU": "en-AU-NatashaNeural",
+    "M-AU": "en-AU-WilliamNeural",
 }
 GENDER = {"Narrator": "Female", "Han": "Female", "Maria": "Female", "Mr Park": "Male",
-          "Dr Morris": "Male", "Daniel": "Male", "Seo-yeon": "Female", "Professor Kang": "Male"}
+          "Dr Morris": "Male", "Daniel": "Male", "Seo-yeon": "Female", "Professor Kang": "Male",
+          "W-US": "Female", "M-US": "Male", "W-UK": "Female", "M-UK": "Male", "W-AU": "Female", "M-AU": "Male"}
 LOCALE_ORDER = ["en-GB", "en-AU", "en-IE", "en-US", "en-CA", "en-NZ", "en-ZA", "en-IN"]
 MIN_BYTES = 1500     # anything smaller is not real speech
 TURN_GAP = 0.5       # seconds of silence between speakers
@@ -40,6 +48,8 @@ PARA_GAP = 0.6       # between paragraphs of the same speaker
 DEFAULT_PAUSE = 3.0  # for a bare [pause]
 
 LABEL = re.compile(r"^\*\*(.+?):\*\*\s*(.*)$")
+MARK = re.compile(r"^\[\[Q(\d+)\]\]$")          # [[Q7]] on its own line = "question 7 starts here" (for audio-synced highlighting)
+PAUSE_ONLY = re.compile(r"^\*?\[pause(?:\s+(\d+(?:\.\d+)?)\s*seconds?)?\]\*?$", re.I)
 PAUSE = re.compile(r"\*?\[pause(?:\s+(\d+)\s*seconds?)?\]\*?", re.I)
 SPELLED = re.compile(r"\b(?:[A-Z]-){2,}[A-Z]\b")
 
@@ -59,10 +69,17 @@ def parse(md):
             cur = out.setdefault(int(m.group(1)), []); speaker = None; continue
         if cur is None or not line or line.startswith(("#", "---", ">")):
             continue
+        mk = MARK.match(line)
+        if mk:
+            cur.append(("mark", int(mk.group(1)))); continue
+        po = PAUSE_ONLY.match(line)
+        if po:
+            cur.append(("gap", float(po.group(1)) if po.group(1) else DEFAULT_PAUSE)); continue
         lab = LABEL.match(line)
         if lab:
             speaker, text = lab.group(1).strip(), lab.group(2)
-            cur.append(("gap", TURN_GAP)) if cur else None
+            if cur and cur[-1][0] != "gap":
+                cur.append(("gap", TURN_GAP))
         elif speaker:
             text = line
             cur.append(("gap", PARA_GAP))
@@ -117,7 +134,7 @@ async def speak(text, voice, rate, dest, fake):
             await asyncio.sleep(2 * (attempt + 1))
 
 
-async def resolve_voices(rate):
+async def resolve_voices(rate, needed):
     """Test every configured voice with a short sentence; swap any dead voice for a working one of the same gender."""
     import edge_tts
     tmp = Path(tempfile.mkdtemp(prefix="probe-"))
@@ -135,13 +152,14 @@ async def resolve_voices(rate):
         return status[name]
 
     chosen = {}
-    for who, voice in list(VOICES.items()):
+    for who in [w for w in VOICES if w in needed]:
+        voice = VOICES[who]
         if await works(voice) and voice not in chosen.values():
             chosen[who] = voice
             continue
         for v in avail:
             name = v["ShortName"]
-            if v["Gender"] == GENDER.get(who, v["Gender"]) and name not in chosen.values() and name not in VOICES.values() and await works(name):
+            if v["Gender"] == GENDER.get(who, v["Gender"]) and name not in chosen.values() and name not in {VOICES[w] for w in VOICES if w in needed} and await works(name):
                 chosen[who] = name
                 print(f"  voice for {who}: {voice} is unavailable, using {name}")
                 break
@@ -149,7 +167,7 @@ async def resolve_voices(rate):
             sys.exit(f"No working voice found for {who}. Check your internet connection and run again.")
     VOICES.update(chosen)
     shutil.rmtree(tmp, ignore_errors=True)
-    print("Voices:", ", ".join(f"{k}={v}" for k, v in VOICES.items()))
+    print("Voices:", ", ".join(f"{k}={v}" for k, v in chosen.items()))
 
 
 def to_wav(src, dst):
@@ -164,9 +182,12 @@ def silence(sec, dst):
 async def build(n, items, args, out_path):
     cache = Path(".audio-cache"); cache.mkdir(exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix=f"sec{n}-"))
-    parts = []
+    parts, cues, t = [], {}, 0.0
     for i, it in enumerate(items):
         wav = tmp / f"{i:04d}.wav"
+        if it[0] == "mark":
+            cues[str(it[1])] = round(t, 2)
+            continue
         if it[0] == "gap":
             silence(it[1], wav)
         else:
@@ -184,11 +205,15 @@ async def build(n, items, args, out_path):
             else:
                 sys.exit(f"Could not create audio for: {text[:60]}")
         parts.append(wav)
+        with wave.open(str(wav)) as w:
+            t += w.getnframes() / w.getframerate()
     lst = tmp / "list.txt"
     lst.write_text("".join(f"file '{p.as_posix()}'\n" for p in parts))
     joined = tmp / "joined.wav"
     run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(joined)])
-    run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(joined), "-ac", "1", "-ar", "44100", "-b:a", "64k", str(out_path)])
+    run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(joined), "-ac", "1", "-ar", "44100", "-b:a", args.bitrate, str(out_path)])
+    if cues:   # lets the exam highlight and scroll to the current question in sync with the recording
+        out_path.with_suffix(".cues.json").write_text(json.dumps({"cues": cues, "duration": round(t, 2)}))
     shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -199,6 +224,7 @@ def main():
     ap.add_argument("--test-id", default="odilxanivich-1-listening")
     ap.add_argument("--sections", default="")
     ap.add_argument("--rate", default="-3%")
+    ap.add_argument("--bitrate", default="64k", help="MP3 bitrate (default 64k; use 48k for smaller files)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--fake", action="store_true")
     args = ap.parse_args()
@@ -212,20 +238,21 @@ def main():
         except ImportError:
             sys.exit("Run first:  pip install edge-tts")
 
-    if not args.fake and not args.dry_run:
-        asyncio.run(resolve_voices(args.rate))
     secs = parse(Path(args.script).read_text(encoding="utf-8"))
+    if not args.fake and not args.dry_run:
+        used = {i[1] for items in secs.values() for i in items if i[0] == "say"}
+        asyncio.run(resolve_voices(args.rate, used))
     want = {int(x) for x in args.sections.split(",") if x} or set(secs)
     Path(args.out).mkdir(parents=True, exist_ok=True)
     for n in sorted(secs):
         if n not in want:
             continue
         items = secs[n]
-        total = sum(est_seconds(i[2]) if i[0] == "say" else i[1] for i in items)
+        total = sum(est_seconds(i[2]) if i[0] == "say" else (i[1] if i[0] == "gap" else 0) for i in items)
         print(f"Section {n}: {sum(i[0] == 'say' for i in items)} lines, ~{total / 60:.1f} min")
         if args.dry_run:
             for it in items:
-                print("   ", f"[{it[1]}] {it[2][:70]}" if it[0] == "say" else f"(pause {it[1]:g}s)")
+                print("   ", f"[{it[1]}] {it[2][:70]}" if it[0] == "say" else (f"(pause {it[1]:g}s)" if it[0] == "gap" else f"<question {it[1]} starts>"))
             continue
         out = Path(args.out) / f"{args.test_id}-section-{n}.mp3"
         asyncio.run(build(n, items, args, out))
