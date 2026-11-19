@@ -48,6 +48,7 @@ PARA_GAP = 0.6       # between paragraphs of the same speaker
 DEFAULT_PAUSE = 3.0  # for a bare [pause]
 
 LABEL = re.compile(r"^\*\*(.+?):\*\*\s*(.*)$")
+HEADER = re.compile(r"^<!--\s*(test-id|out)\s*:\s*(.+?)\s*-->\s*$", re.M)   # <!-- test-id: ... --> and <!-- out: ... --> at the top of a script
 MARK = re.compile(r"^\[\[Q(\d+)\]\]$")          # [[Q7]] on its own line = "question 7 starts here" (for audio-synced highlighting)
 PAUSE_ONLY = re.compile(r"^\*?\[pause(?:\s+(\d+(?:\.\d+)?)\s*seconds?)?\]\*?$", re.I)
 PAUSE = re.compile(r"\*?\[pause(?:\s+(\d+)\s*seconds?)?\]\*?", re.I)
@@ -220,8 +221,8 @@ async def build(n, items, args, out_path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("script")
-    ap.add_argument("--out", default="ielts")
-    ap.add_argument("--test-id", default="odilxanivich-1-listening")
+    ap.add_argument("--out", default=None, help="output folder (default: taken from the script, e.g. ielts or toeic)")
+    ap.add_argument("--test-id", default=None, help="file prefix (default: taken from the script)")
     ap.add_argument("--sections", default="")
     ap.add_argument("--rate", default="-3%")
     ap.add_argument("--bitrate", default="64k", help="MP3 bitrate (default 64k; use 48k for smaller files)")
@@ -238,7 +239,18 @@ def main():
         except ImportError:
             sys.exit("Run first:  pip install edge-tts")
 
-    secs = parse(Path(args.script).read_text(encoding="utf-8"))
+    text = Path(args.script).read_text(encoding="utf-8")
+    meta = dict(HEADER.findall(text))
+    # Each script says which test it belongs to. Refuse a mismatch, so one test's audio can never be saved under another's name.
+    for flag, key, given in (("--test-id", "test-id", args.test_id), ("--out", "out", args.out)):
+        if given and meta.get(key) and given != meta[key]:
+            sys.exit(f"This script is for {key} '{meta[key]}', but you passed {flag} '{given}'. Check you are using the right script file.")
+    if not meta and not (args.test_id and args.out):
+        sys.exit("This script has no '<!-- test-id: ... -->' header, so I can't tell which test it is for.\nUse the latest script file, or pass both --test-id and --out explicitly. (Nothing was written.)")
+    args.test_id = args.test_id or meta.get("test-id")
+    args.out = args.out or meta.get("out")
+    print(f"Script: {Path(args.script).name}  ->  {args.out}/{args.test_id}-section-N.mp3")
+    secs = parse(text)
     if not args.fake and not args.dry_run:
         used = {i[1] for items in secs.values() for i in items if i[0] == "say"}
         asyncio.run(resolve_voices(args.rate, used))
